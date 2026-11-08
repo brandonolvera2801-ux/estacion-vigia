@@ -55,7 +55,7 @@ Compila sin advertencias en Windows (MinGW) el comando es el mismo y el ejecutab
 | _Nombre 1_ | _Fase 1_ |
 | _Nombre 2_ | _Fase 2_ |
 | _Nombre 3_ | _Fase 3_ |
-| _Nombre 4_ | _Integración, menú y documentación_ |
+| _Brandon Olvera_ | _Integración, menú y documentación_ |
 
 ## Pendiente para el proyecto final
 
