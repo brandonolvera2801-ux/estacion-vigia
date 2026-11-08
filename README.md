@@ -11,7 +11,7 @@ gcc -Wall -Wextra -std=c99 -o estacion_vigia estacion_vigia.c
 ./estacion_vigia
 ```
 
-Compila sin advertencias con `-Wall -Wextra -pedantic`. En Windows (MinGW) el comando es el mismo y el ejecutable se llama `estacion_vigia.exe`.
+Compila sin advertencias con Windows (MinGW) el comando es el mismo y el ejecutable se llama `estacion_vigia.exe`.
 
 ## Estructuras implementadas
 
