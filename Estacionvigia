@@ -1,1 +1,789 @@
 
+/*
+ * ============================================================================
+ *  PROYECTO "ESTACION VIGIA"  -  Corte de proyecto (Fases 1, 2 y 3)
+ *  Estructura de Datos 2026A  -  CUValles / UdeG
+ * ----------------------------------------------------------------------------
+ *  Fase 1: Buffer dinamico de lecturas + estadisticas (malloc/realloc/free)
+ *  Fase 2: Registro de eventos/alertas con LISTA ENLAZADA
+ *  Fase 3: COLA de comandos (FIFO) + PILA de "deshacer" (LIFO)
+ *
+ *  Tipos Abstractos de Datos (TAD) usados:
+ *     Buffer         -> arreglo dinamico de lecturas
+ *     ListaEventos   -> lista enlazada simple con puntero a cabeza y cola
+ *     Cola           -> FIFO con nodos enlazados (frente / final)
+ *     Pila           -> LIFO con nodos enlazados (tope)
+ *     Actuador       -> estado del hardware simulado
+ *
+ *  Compilar:  gcc -Wall -Wextra -std=c99 -o estacion_vigia estacion_vigia.c
+ *  Ejecutar:  ./estacion_vigia
+ * ============================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+
+#define CAP_INICIAL   8
+#define MAX_CAPTURA   1000
+#define UMBRAL_ALTO   80.0
+#define UMBRAL_BAJO   20.0
+
+/* ======================================================================== */
+/*  UTILIDADES DE ENTRADA SEGURA (no truena con entradas raras)             */
+/* ======================================================================== */
+
+/* Lee una linea completa; descarta el exceso. Devuelve 0 si hay EOF. */
+static int leer_linea(char *dest, size_t tam)
+{
+    size_t len;
+    int c;
+
+    if (fgets(dest, (int)tam, stdin) == NULL)
+        return 0;
+    len = strlen(dest);
+    if (len > 0 && dest[len - 1] == '\n')
+        dest[len - 1] = '\0';
+    else
+        while ((c = getchar()) != '\n' && c != EOF)
+            ;
+    return 1;
+}
+
+/* Pide un entero en [min, max]. Repite hasta que sea valido. 0 si EOF. */
+static int leer_entero(const char *msg, int min, int max, int *out)
+{
+    char linea[64];
+    char *fin;
+    long v;
+
+    for (;;) {
+        printf("%s", msg);
+        if (!leer_linea(linea, sizeof linea))
+            return 0;
+        v = strtol(linea, &fin, 10);
+        if (fin == linea || *fin != '\0') {
+            printf("  Entrada invalida. Escribe un numero entero.\n");
+            continue;
+        }
+        if (v < min || v > max) {
+            printf("  Fuera de rango (%d a %d).\n", min, max);
+            continue;
+        }
+        *out = (int)v;
+        return 1;
+    }
+}
+
+/* Pide un real finito. Repite hasta que sea valido. 0 si EOF. */
+static int leer_real(const char *msg, double *out)
+{
+    char linea[64];
+    char *fin;
+    double v;
+
+    for (;;) {
+        printf("%s", msg);
+        if (!leer_linea(linea, sizeof linea))
+            return 0;
+        v = strtod(linea, &fin);
+        if (fin == linea || *fin != '\0' || !isfinite(v)) {
+            printf("  Entrada invalida. Escribe un numero (ej. 45.5).\n");
+            continue;
+        }
+        *out = v;
+        return 1;
+    }
+}
+
+/* ======================================================================== */
+/*  FASE 1 - TAD BUFFER DINAMICO DE LECTURAS                                */
+/* ======================================================================== */
+
+typedef struct {
+    double *datos;   /* bloque reservado con malloc/realloc */
+    int     n;       /* lecturas almacenadas */
+    int     cap;     /* capacidad actual */
+} Buffer;
+
+static int buffer_crear(Buffer *b, int cap)
+{
+    b->datos = (double *)malloc((size_t)cap * sizeof(double));
+    b->n = 0;
+    b->cap = (b->datos != NULL) ? cap : 0;
+    return b->datos != NULL;
+}
+
+/* Agrega una lectura; si esta lleno duplica la capacidad con realloc. */
+static int buffer_agregar(Buffer *b, double valor)
+{
+    if (b->n == b->cap) {
+        int nueva = (b->cap > 0) ? b->cap * 2 : CAP_INICIAL;
+        double *tmp = (double *)realloc(b->datos, (size_t)nueva * sizeof(double));
+        if (tmp == NULL)
+            return 0;               /* el bloque original sigue intacto */
+        b->datos = tmp;
+        b->cap = nueva;
+    }
+    b->datos[b->n++] = valor;
+    return 1;
+}
+
+static void buffer_liberar(Buffer *b)
+{
+    free(b->datos);
+    b->datos = NULL;
+    b->n = 0;
+    b->cap = 0;
+}
+
+/* Recorre el buffer con aritmetica de punteros. Devuelve 0 si esta vacio. */
+static int buffer_estadisticas(const Buffer *b, double *prom, double *max,
+                               double *min, int *i_max, int *i_min)
+{
+    const double *p;
+    const double *fin;
+    double suma = 0.0;
+
+    if (b->n == 0)
+        return 0;
+
+    fin = b->datos + b->n;
+    *max = *min = *b->datos;
+    *i_max = *i_min = 0;
+
+    for (p = b->datos; p < fin; p++) {
+        int idx = (int)(p - b->datos);
+        suma += *p;
+        if (*p > *max) { *max = *p; *i_max = idx; }
+        if (*p < *min) { *min = *p; *i_min = idx; }
+    }
+    *prom = suma / b->n;
+    return 1;
+}
+
+/* ======================================================================== */
+/*  FASE 2 - TAD LISTA ENLAZADA DE EVENTOS / ALERTAS                        */
+/* ======================================================================== */
+
+typedef struct Evento {
+    int            id;
+    char           tipo[8];    /* "ALTA" o "BAJA" */
+    int            indice;     /* numero de lectura que lo origino (1..n) */
+    double         valor;
+    double         umbral;
+    struct Evento *sig;
+} Evento;
+
+typedef struct {
+    Evento *cabeza;
+    Evento *cola;              /* ultimo nodo: insercion al final en O(1) */
+    int     total;
+    int     siguiente_id;
+} ListaEventos;
+
+static void eventos_iniciar(ListaEventos *l)
+{
+    l->cabeza = NULL;
+    l->cola = NULL;
+    l->total = 0;
+    l->siguiente_id = 1;
+}
+
+/* Inserta al final (orden cronologico). Devuelve el nodo o NULL. */
+static Evento *eventos_registrar(ListaEventos *l, const char *tipo, int indice,
+                                 double valor, double umbral)
+{
+    Evento *nuevo = (Evento *)malloc(sizeof(Evento));
+    if (nuevo == NULL)
+        return NULL;
+
+    nuevo->id = l->siguiente_id++;
+    snprintf(nuevo->tipo, sizeof nuevo->tipo, "%s", tipo);
+    nuevo->indice = indice;
+    nuevo->valor = valor;
+    nuevo->umbral = umbral;
+    nuevo->sig = NULL;
+
+    if (l->cabeza == NULL)
+        l->cabeza = nuevo;
+    else
+        l->cola->sig = nuevo;
+    l->cola = nuevo;
+    l->total++;
+    return nuevo;
+}
+
+static void evento_imprimir(const Evento *e)
+{
+    printf("  #%-3d  %-4s  lectura %-4d  valor %7.2f  (umbral %.2f)\n",
+           e->id, e->tipo, e->indice, e->valor, e->umbral);
+}
+
+static void eventos_mostrar(const ListaEventos *l)
+{
+    const Evento *e;
+
+    if (l->cabeza == NULL) {
+        printf("  (no hay eventos registrados)\n");
+        return;
+    }
+    for (e = l->cabeza; e != NULL; e = e->sig)
+        evento_imprimir(e);
+    printf("  Total: %d evento(s)\n", l->total);
+}
+
+/* Busca por tipo y los imprime. Devuelve cuantos encontro. */
+static int eventos_buscar_tipo(const ListaEventos *l, const char *tipo)
+{
+    const Evento *e;
+    int hallados = 0;
+
+    for (e = l->cabeza; e != NULL; e = e->sig) {
+        if (strcmp(e->tipo, tipo) == 0) {
+            evento_imprimir(e);
+            hallados++;
+        }
+    }
+    return hallados;
+}
+
+/* Reubica el puntero 'cola' despues de eliminar nodos. */
+static void eventos_recalcular_cola(ListaEventos *l)
+{
+    Evento *e = l->cabeza;
+
+    l->cola = NULL;
+    while (e != NULL) {
+        l->cola = e;
+        e = e->sig;
+    }
+}
+
+/* Elimina el evento con ese id (puntero a puntero). Devuelve 1 si existia. */
+static int eventos_eliminar_id(ListaEventos *l, int id)
+{
+    Evento **pp = &l->cabeza;
+
+    while (*pp != NULL && (*pp)->id != id)
+        pp = &(*pp)->sig;
+    if (*pp == NULL)
+        return 0;
+
+    {
+        Evento *borrar = *pp;
+        *pp = borrar->sig;       /* el enlace anterior salta el nodo */
+        free(borrar);
+    }
+    l->total--;
+    eventos_recalcular_cola(l);
+    return 1;
+}
+
+/* Elimina todos los eventos de un tipo. Devuelve cuantos borro. */
+static int eventos_eliminar_tipo(ListaEventos *l, const char *tipo)
+{
+    Evento **pp = &l->cabeza;
+    int borrados = 0;
+
+    while (*pp != NULL) {
+        if (strcmp((*pp)->tipo, tipo) == 0) {
+            Evento *borrar = *pp;
+            *pp = borrar->sig;
+            free(borrar);
+            l->total--;
+            borrados++;
+        } else {
+            pp = &(*pp)->sig;
+        }
+    }
+    eventos_recalcular_cola(l);
+    return borrados;
+}
+
+static void eventos_vaciar(ListaEventos *l)
+{
+    Evento *e = l->cabeza;
+
+    while (e != NULL) {
+        Evento *sig = e->sig;
+        free(e);
+        e = sig;
+    }
+    l->cabeza = NULL;
+    l->cola = NULL;
+    l->total = 0;
+}
+
+/* ======================================================================== */
+/*  FASE 3 - ACTUADOR, COMANDOS, TAD COLA (FIFO) Y TAD PILA (LIFO)          */
+/* ======================================================================== */
+
+typedef enum { CMD_VENTILADOR = 1, CMD_VALVULA = 2, CMD_ALARMA = 3 } TipoCmd;
+
+typedef struct {
+    int     id;
+    TipoCmd tipo;
+    int     valor;     /* ventilador/alarma: 0 o 1 ; valvula: 0..100 */
+} Comando;
+
+typedef struct {
+    int ventilador;    /* 0 apagado, 1 encendido */
+    int valvula;       /* apertura 0..100 % */
+    int alarma;        /* 0 apagada, 1 encendida */
+} Actuador;
+
+/* Devuelve un puntero al campo del actuador que maneja ese comando. */
+static int *actuador_campo(Actuador *a, TipoCmd t)
+{
+    switch (t) {
+        case CMD_VENTILADOR: return &a->ventilador;
+        case CMD_VALVULA:    return &a->valvula;
+        default:             return &a->alarma;
+    }
+}
+
+static const char *cmd_nombre(TipoCmd t)
+{
+    switch (t) {
+        case CMD_VENTILADOR: return "Ventilador";
+        case CMD_VALVULA:    return "Valvula";
+        default:             return "Alarma";
+    }
+}
+
+static void cmd_imprimir_valor(TipoCmd t, int valor)
+{
+    if (t == CMD_VALVULA)
+        printf("%d%%", valor);
+    else
+        printf("%s", valor ? "ENCENDIDO" : "APAGADO");
+}
+
+static void actuador_mostrar(const Actuador *a)
+{
+    printf("  Estado del actuador -> Ventilador: %s | Valvula: %d%% | Alarma: %s\n",
+           a->ventilador ? "ENCENDIDO" : "APAGADO", a->valvula,
+           a->alarma ? "ENCENDIDA" : "APAGADA");
+}
+
+/* ----- COLA (FIFO) con nodos enlazados ----- */
+
+typedef struct NodoCola {
+    Comando          cmd;
+    struct NodoCola *sig;
+} NodoCola;
+
+typedef struct {
+    NodoCola *frente;
+    NodoCola *final;
+    int       tam;
+} Cola;
+
+static void cola_iniciar(Cola *c)
+{
+    c->frente = NULL;
+    c->final = NULL;
+    c->tam = 0;
+}
+
+static int cola_vacia(const Cola *c) { return c->frente == NULL; }
+
+static int cola_encolar(Cola *c, Comando cmd)
+{
+    NodoCola *n = (NodoCola *)malloc(sizeof(NodoCola));
+    if (n == NULL)
+        return 0;
+    n->cmd = cmd;
+    n->sig = NULL;
+    if (c->final == NULL)
+        c->frente = n;
+    else
+        c->final->sig = n;
+    c->final = n;
+    c->tam++;
+    return 1;
+}
+
+static int cola_desencolar(Cola *c, Comando *out)
+{
+    NodoCola *n = c->frente;
+
+    if (n == NULL)
+        return 0;
+    *out = n->cmd;
+    c->frente = n->sig;
+    if (c->frente == NULL)
+        c->final = NULL;
+    free(n);
+    c->tam--;
+    return 1;
+}
+
+static void cola_mostrar(const Cola *c)
+{
+    const NodoCola *n;
+    int pos = 1;
+
+    if (cola_vacia(c)) {
+        printf("  (cola vacia)\n");
+        return;
+    }
+    for (n = c->frente; n != NULL; n = n->sig, pos++) {
+        printf("  %d) [cmd #%d] %s -> ", pos, n->cmd.id, cmd_nombre(n->cmd.tipo));
+        cmd_imprimir_valor(n->cmd.tipo, n->cmd.valor);
+        printf("\n");
+    }
+}
+
+static void cola_vaciar(Cola *c)
+{
+    Comando descarte;
+    while (cola_desencolar(c, &descarte))
+        ;
+}
+
+/* ----- PILA (LIFO) con nodos enlazados ----- */
+
+typedef struct NodoPila {
+    Comando          cmd;      /* guarda el valor ANTERIOR (para deshacer) */
+    struct NodoPila *sig;
+} NodoPila;
+
+typedef struct {
+    NodoPila *tope;
+    int       tam;
+} Pila;
+
+static void pila_iniciar(Pila *p)
+{
+    p->tope = NULL;
+    p->tam = 0;
+}
+
+static int pila_vacia(const Pila *p) { return p->tope == NULL; }
+
+static int pila_push(Pila *p, Comando cmd)
+{
+    NodoPila *n = (NodoPila *)malloc(sizeof(NodoPila));
+    if (n == NULL)
+        return 0;
+    n->cmd = cmd;
+    n->sig = p->tope;
+    p->tope = n;
+    p->tam++;
+    return 1;
+}
+
+static int pila_pop(Pila *p, Comando *out)
+{
+    NodoPila *n = p->tope;
+
+    if (n == NULL)
+        return 0;
+    *out = n->cmd;
+    p->tope = n->sig;
+    free(n);
+    p->tam--;
+    return 1;
+}
+
+static void pila_vaciar(Pila *p)
+{
+    Comando descarte;
+    while (pila_pop(p, &descarte))
+        ;
+}
+
+/* ======================================================================== */
+/*  OPERACIONES DEL MENU                                                    */
+/* ======================================================================== */
+
+typedef struct {
+    double alto;
+    double bajo;
+} Umbrales;
+
+/* Revisa una lectura contra los umbrales y registra el evento si cruza. */
+static void revisar_umbral(ListaEventos *ev, const Umbrales *u, int indice,
+                           double valor)
+{
+    Evento *e = NULL;
+
+    if (valor > u->alto)
+        e = eventos_registrar(ev, "ALTA", indice, valor, u->alto);
+    else if (valor < u->bajo)
+        e = eventos_registrar(ev, "BAJA", indice, valor, u->bajo);
+    else
+        return;
+
+    if (e == NULL) {
+        printf("  [!] No hay memoria para registrar el evento.\n");
+        return;
+    }
+    printf("  [!] ALERTA registrada: ");
+    evento_imprimir(e);
+}
+
+/* Opcion 1 - Fase 1 (+ deteccion de eventos de Fase 2) */
+static void opcion_capturar(Buffer *b, ListaEventos *ev, Umbrales *u)
+{
+    int n, modo, cambiar, i;
+    double v;
+
+    printf("\n--- Captura de lecturas ---\n");
+    printf("Umbrales actuales: ALTO > %.2f | BAJO < %.2f\n", u->alto, u->bajo);
+    if (!leer_entero("Cambiar umbrales? (1=si, 0=no): ", 0, 1, &cambiar))
+        return;
+    if (cambiar) {
+        double alto, bajo;
+        if (!leer_real("  Nuevo umbral ALTO: ", &alto))
+            return;
+        if (!leer_real("  Nuevo umbral BAJO: ", &bajo))
+            return;
+        if (bajo >= alto) {
+            printf("  El umbral bajo debe ser menor que el alto. Sin cambios.\n");
+        } else {
+            u->alto = alto;
+            u->bajo = bajo;
+        }
+    }
+
+    if (!leer_entero("Cuantas lecturas capturar (1-1000)? ", 1, MAX_CAPTURA, &n))
+        return;
+    if (!leer_entero("Modo (1=manual, 2=aleatorio 0-100): ", 1, 2, &modo))
+        return;
+
+    for (i = 1; i <= n; i++) {
+        if (modo == 1) {
+            char msg[48];
+            snprintf(msg, sizeof msg, "  Lectura %d: ", b->n + 1);
+            if (!leer_real(msg, &v))
+                return;
+        } else {
+            v = (double)(rand() % 1001) / 10.0;
+        }
+        if (!buffer_agregar(b, v)) {
+            printf("  [!] Sin memoria: captura detenida.\n");
+            return;
+        }
+        revisar_umbral(ev, u, b->n, v);
+    }
+    printf("Captura terminada. Lecturas en el buffer: %d (capacidad %d)\n",
+           b->n, b->cap);
+}
+
+/* Opcion 2 - Fase 1 */
+static void opcion_ver_lecturas(const Buffer *b, const Umbrales *u)
+{
+    double prom, max, min;
+    int i_max, i_min, i;
+
+    printf("\n--- Lecturas y estadisticas ---\n");
+    if (!buffer_estadisticas(b, &prom, &max, &min, &i_max, &i_min)) {
+        printf("  (no hay lecturas; usa la opcion 1)\n");
+        return;
+    }
+    for (i = 0; i < b->n; i++) {
+        const char *marca = "";
+        if (b->datos[i] > u->alto)      marca = "  <- ALTA";
+        else if (b->datos[i] < u->bajo) marca = "  <- BAJA";
+        printf("  [%3d] %7.2f%s\n", i + 1, b->datos[i], marca);
+    }
+    printf("\n  Cantidad : %d\n", b->n);
+    printf("  Promedio : %.2f\n", prom);
+    printf("  Maximo   : %.2f (lectura %d)\n", max, i_max + 1);
+    printf("  Minimo   : %.2f (lectura %d)\n", min, i_min + 1);
+}
+
+/* Opcion 3 - Fase 2 (submenu: mostrar, buscar, eliminar) */
+static void opcion_eventos(ListaEventos *ev)
+{
+    int op;
+
+    for (;;) {
+        printf("\n--- Registro de eventos/alertas ---\n");
+        printf("  1. Mostrar todos\n");
+        printf("  2. Buscar por tipo (ALTA/BAJA)\n");
+        printf("  3. Eliminar un evento por id\n");
+        printf("  4. Eliminar todos los de un tipo\n");
+        printf("  0. Volver\n");
+        if (!leer_entero("  Opcion: ", 0, 4, &op) || op == 0)
+            return;
+
+        if (op == 1) {
+            eventos_mostrar(ev);
+        } else if (op == 2 || op == 4) {
+            int t;
+            const char *tipo;
+            if (!leer_entero("  Tipo (1=ALTA, 2=BAJA): ", 1, 2, &t))
+                return;
+            tipo = (t == 1) ? "ALTA" : "BAJA";
+            if (op == 2) {
+                if (eventos_buscar_tipo(ev, tipo) == 0)
+                    printf("  No hay eventos de tipo %s.\n", tipo);
+            } else {
+                printf("  Se eliminaron %d evento(s) %s.\n",
+                       eventos_eliminar_tipo(ev, tipo), tipo);
+            }
+        } else {
+            int id;
+            if (!leer_entero("  Id del evento: ", 1, 1000000, &id))
+                return;
+            if (eventos_eliminar_id(ev, id))
+                printf("  Evento #%d eliminado.\n", id);
+            else
+                printf("  No existe un evento con id %d.\n", id);
+        }
+    }
+}
+
+/* Opcion 4 - Fase 3: encolar un comando */
+static void opcion_enviar_comando(Cola *cola, int *contador_cmd,
+                                  const Actuador *act)
+{
+    Comando c;
+    int actuador, valor;
+
+    printf("\n--- Enviar comando al actuador ---\n");
+    actuador_mostrar(act);
+    printf("  1. Ventilador (0=apagar, 1=encender)\n");
+    printf("  2. Valvula    (apertura 0-100)\n");
+    printf("  3. Alarma     (0=apagar, 1=encender)\n");
+    if (!leer_entero("  Actuador: ", 1, 3, &actuador))
+        return;
+
+    c.tipo = (TipoCmd)actuador;
+    if (c.tipo == CMD_VALVULA) {
+        if (!leer_entero("  Apertura (0-100): ", 0, 100, &valor))
+            return;
+    } else {
+        if (!leer_entero("  Valor (0=apagar, 1=encender): ", 0, 1, &valor))
+            return;
+    }
+    c.id = ++(*contador_cmd);
+    c.valor = valor;
+
+    if (!cola_encolar(cola, c)) {
+        printf("  [!] Sin memoria para encolar el comando.\n");
+        --(*contador_cmd);
+        return;
+    }
+    printf("  Comando #%d encolado. Pendientes:\n", c.id);
+    cola_mostrar(cola);
+}
+
+/* Opcion 5 - Fase 3: ejecutar la cola en orden FIFO, guardando en la pila */
+static void opcion_ejecutar(Cola *cola, Pila *pila, Actuador *act)
+{
+    Comando c;
+    int ejecutados = 0;
+
+    printf("\n--- Ejecutar comandos pendientes (FIFO) ---\n");
+    if (cola_vacia(cola)) {
+        printf("  No hay comandos pendientes.\n");
+        return;
+    }
+    while (cola_desencolar(cola, &c)) {
+        int *campo = actuador_campo(act, c.tipo);
+        Comando inverso = c;
+
+        inverso.valor = *campo;         /* valor anterior, para deshacer */
+        if (!pila_push(pila, inverso)) {
+            printf("  [!] Sin memoria para la pila; comando #%d no ejecutado.\n",
+                   c.id);
+            continue;
+        }
+        *campo = c.valor;
+        printf("  Ejecutado cmd #%d: %s = ", c.id, cmd_nombre(c.tipo));
+        cmd_imprimir_valor(c.tipo, c.valor);
+        printf("\n");
+        ejecutados++;
+    }
+    printf("  %d comando(s) ejecutado(s). Historial para deshacer: %d\n",
+           ejecutados, pila->tam);
+    actuador_mostrar(act);
+}
+
+/* Opcion 6 - Fase 3: deshacer el ultimo comando (LIFO) */
+static void opcion_deshacer(Pila *pila, Actuador *act)
+{
+    Comando c;
+
+    printf("\n--- Deshacer ultimo comando (pila) ---\n");
+    if (pila_vacia(pila) || !pila_pop(pila, &c)) {
+        printf("  No hay nada que deshacer.\n");
+        return;
+    }
+    *actuador_campo(act, c.tipo) = c.valor;
+    printf("  Deshecho cmd #%d: %s regresa a ", c.id, cmd_nombre(c.tipo));
+    cmd_imprimir_valor(c.tipo, c.valor);
+    printf("\n");
+    actuador_mostrar(act);
+    printf("  Quedan %d accion(es) por deshacer.\n", pila->tam);
+}
+
+/* ======================================================================== */
+/*  PROGRAMA PRINCIPAL                                                      */
+/* ======================================================================== */
+
+static void mostrar_menu(void)
+{
+    printf("\n===== ESTACION VIGIA =====\n");
+    printf("1. Capturar lecturas (buffer dinamico)     <- Fase 1\n");
+    printf("2. Ver lecturas y estadisticas             <- Fase 1\n");
+    printf("3. Ver registro de eventos/alertas         <- Fase 2\n");
+    printf("4. Enviar comando al actuador (cola)       <- Fase 3\n");
+    printf("5. Ejecutar comandos pendientes            <- Fase 3\n");
+    printf("6. Deshacer ultimo comando (pila)          <- Fase 3\n");
+    printf("0. Salir (libera toda la memoria)\n");
+}
+
+int main(void)
+{
+    Buffer       buffer;
+    ListaEventos eventos;
+    Cola         cola;
+    Pila         pila;
+    Actuador     actuador = {0, 0, 0};
+    Umbrales     umbrales = {UMBRAL_ALTO, UMBRAL_BAJO};
+    int          contador_cmd = 0;
+    int          opcion = -1;
+
+    srand((unsigned int)time(NULL));
+
+    if (!buffer_crear(&buffer, CAP_INICIAL)) {
+        fprintf(stderr, "Error: no se pudo reservar memoria para el buffer.\n");
+        return EXIT_FAILURE;
+    }
+    eventos_iniciar(&eventos);
+    cola_iniciar(&cola);
+    pila_iniciar(&pila);
+
+    while (opcion != 0) {
+        mostrar_menu();
+        if (!leer_entero("Opcion: ", 0, 6, &opcion))
+            opcion = 0;                 /* EOF: salir limpiamente */
+
+        switch (opcion) {
+            case 1: opcion_capturar(&buffer, &eventos, &umbrales);          break;
+            case 2: opcion_ver_lecturas(&buffer, &umbrales);                break;
+            case 3: opcion_eventos(&eventos);                               break;
+            case 4: opcion_enviar_comando(&cola, &contador_cmd, &actuador); break;
+            case 5: opcion_ejecutar(&cola, &pila, &actuador);               break;
+            case 6: opcion_deshacer(&pila, &actuador);                      break;
+            default: break;
+        }
+    }
+
+    /* Liberacion total de memoria */
+    buffer_liberar(&buffer);
+    eventos_vaciar(&eventos);
+    cola_vaciar(&cola);
+    pila_vaciar(&pila);
+
+    printf("\nMemoria liberada. Fin del programa.\n");
+    return EXIT_SUCCESS;
+}
